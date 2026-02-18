@@ -33,6 +33,11 @@ function printHelp(): void {
   process.stdout.write(`  SKYCLAW_DB_PATH=.skyclaw/coordinator.db\n`);
   process.stdout.write(`  SKYCLAW_GATEWAY_PORT=8790\n`);
   process.stdout.write(`  SKYCLAW_GATEWAY_REFRESH_MS=3000\n`);
+  process.stdout.write(`  SKYCLAW_GATEWAY_HEALTH_PROBE_MS=5000\n`);
+  process.stdout.write(`  SKYCLAW_GATEWAY_HEALTH_PATH=/health\n`);
+  process.stdout.write(`  SKYCLAW_GATEWAY_HEALTH_TIMEOUT_MS=1500\n`);
+  process.stdout.write(`  SKYCLAW_GATEWAY_RETRY_ATTEMPTS=1\n`);
+  process.stdout.write(`  SKYCLAW_GATEWAY_UNHEALTHY_COOLDOWN_MS=10000\n`);
 }
 
 function parsePublicApiKeysFromEnv(): PublicApiKey[] {

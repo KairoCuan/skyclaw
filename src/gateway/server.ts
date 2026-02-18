@@ -10,6 +10,11 @@ export interface GatewayServerOptions {
   coordinatorUrls: string[];
   token?: string;
   refreshMs?: number;
+  healthProbeMs?: number;
+  healthPath?: string;
+  healthTimeoutMs?: number;
+  retryAttempts?: number;
+  unhealthyCooldownMs?: number;
 }
 
 class CoordinatorClient {
@@ -52,8 +57,11 @@ export async function startGatewayServer(options: GatewayServerOptions): Promise
     throw new Error("at least one coordinator URL is required for gateway");
   }
 
-  const registry = new GatewayRegistry();
+  const registry = new GatewayRegistry({ unhealthyCooldownMs: options.unhealthyCooldownMs });
   const client = new CoordinatorClient(options.coordinatorUrls, options.token);
+  const retryAttempts = Math.max(0, options.retryAttempts ?? 1);
+  const healthPath = options.healthPath || "/health";
+  const healthTimeoutMs = Math.max(500, options.healthTimeoutMs ?? 1_500);
 
   const refresh = async () => {
     try {
@@ -69,6 +77,9 @@ export async function startGatewayServer(options: GatewayServerOptions): Promise
   setInterval(() => {
     void refresh();
   }, options.refreshMs ?? 3_000).unref();
+  setInterval(() => {
+    void probeEndpoints(registry, healthPath, healthTimeoutMs);
+  }, options.healthProbeMs ?? 5_000).unref();
 
   const server = createServer(async (req, res) => {
     try {
@@ -93,27 +104,64 @@ export async function startGatewayServer(options: GatewayServerOptions): Promise
 
       const serviceKey = decodeURIComponent(match[1]);
       const servicePath = match[2] || "/";
-      const targetBase = registry.nextEndpoint(serviceKey);
-      if (!targetBase) {
+      const method = req.method.toUpperCase();
+      const attempts = isRetryableMethod(method) ? retryAttempts + 1 : 1;
+      const targetBases = registry.nextEndpoints(serviceKey, attempts);
+      if (targetBases.length === 0) {
         sendJson(res, 503, { error: `no healthy endpoints for service ${serviceKey}` });
         return;
       }
-
-      const targetUrl = `${targetBase}${servicePath}${search}`;
       const bodyBuffer = await readBody(req);
-      const upstream = await fetch(targetUrl, {
-        method: req.method,
-        headers: filterRequestHeaders(req.headers),
-        body: bodyBuffer.length > 0 ? new Uint8Array(bodyBuffer) : undefined
-      });
+      let lastError: Error | undefined;
+      let lastUpstream: Response | undefined;
 
-      res.statusCode = upstream.status;
-      upstream.headers.forEach((value, key) => {
-        if (key.toLowerCase() === "transfer-encoding") return;
-        res.setHeader(key, value);
-      });
-      const out = Buffer.from(await upstream.arrayBuffer());
-      res.end(out);
+      for (const targetBase of targetBases) {
+        const targetUrl = `${targetBase}${servicePath}${search}`;
+        try {
+          const upstream = await fetch(targetUrl, {
+            method,
+            headers: filterRequestHeaders(req.headers),
+            body: bodyBuffer.length > 0 ? new Uint8Array(bodyBuffer) : undefined
+          });
+
+          if (upstream.status >= 500 && targetBase !== targetBases[targetBases.length - 1]) {
+            registry.markEndpointFailure(targetBase);
+            lastUpstream = upstream;
+            continue;
+          }
+
+          if (upstream.status >= 500) {
+            registry.markEndpointFailure(targetBase);
+          } else {
+            registry.markEndpointSuccess(targetBase);
+          }
+
+          res.statusCode = upstream.status;
+          upstream.headers.forEach((value, key) => {
+            if (key.toLowerCase() === "transfer-encoding") return;
+            res.setHeader(key, value);
+          });
+          const out = Buffer.from(await upstream.arrayBuffer());
+          res.end(out);
+          return;
+        } catch (error) {
+          const wrapped = error instanceof Error ? error : new Error(String(error));
+          lastError = wrapped;
+          registry.markEndpointFailure(targetBase);
+        }
+      }
+
+      if (lastUpstream) {
+        res.statusCode = lastUpstream.status;
+        lastUpstream.headers.forEach((value, key) => {
+          if (key.toLowerCase() === "transfer-encoding") return;
+          res.setHeader(key, value);
+        });
+        res.end(Buffer.from(await lastUpstream.arrayBuffer()));
+        return;
+      }
+
+      throw lastError || new Error("upstream request failed");
     } catch (error) {
       const msg = error instanceof Error ? error.message : "gateway error";
       sendJson(res, 502, { error: msg });
@@ -166,6 +214,47 @@ export function gatewayConfigFromEnv(coordinatorUrls: string[]): GatewayServerOp
     token: process.env.SKYCLAW_TOKEN,
     host: process.env.SKYCLAW_GATEWAY_HOST || "0.0.0.0",
     port: parseIntEnv("SKYCLAW_GATEWAY_PORT", 8790),
-    refreshMs: parseIntEnv("SKYCLAW_GATEWAY_REFRESH_MS", 3_000)
+    refreshMs: parseIntEnv("SKYCLAW_GATEWAY_REFRESH_MS", 3_000),
+    healthProbeMs: parseIntEnv("SKYCLAW_GATEWAY_HEALTH_PROBE_MS", 5_000),
+    healthPath: process.env.SKYCLAW_GATEWAY_HEALTH_PATH || "/health",
+    healthTimeoutMs: parseIntEnv("SKYCLAW_GATEWAY_HEALTH_TIMEOUT_MS", 1_500),
+    retryAttempts: parseIntEnv("SKYCLAW_GATEWAY_RETRY_ATTEMPTS", 1),
+    unhealthyCooldownMs: parseIntEnv("SKYCLAW_GATEWAY_UNHEALTHY_COOLDOWN_MS", 10_000)
   };
+}
+
+async function probeEndpoints(
+  registry: GatewayRegistry,
+  healthPath: string,
+  timeoutMs: number
+): Promise<void> {
+  const endpoints = registry.listAllEndpoints();
+  await Promise.all(
+    endpoints.map(async (endpoint) => {
+      try {
+        const response = await fetchWithTimeout(`${endpoint}${healthPath}`, timeoutMs, "GET");
+        if (response.ok) {
+          registry.markEndpointSuccess(endpoint);
+        } else {
+          registry.markEndpointFailure(endpoint);
+        }
+      } catch {
+        registry.markEndpointFailure(endpoint);
+      }
+    })
+  );
+}
+
+async function fetchWithTimeout(url: string, timeoutMs: number, method: string): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { method, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function isRetryableMethod(method: string): boolean {
+  return method === "GET" || method === "HEAD" || method === "OPTIONS";
 }

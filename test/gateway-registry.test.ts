@@ -69,4 +69,16 @@ describe("GatewayRegistry", () => {
 
     expect(registry.nextEndpoint("api")).toBeUndefined();
   });
+
+  it("skips unhealthy endpoints until cooldown expires", () => {
+    const registry = new GatewayRegistry({ unhealthyCooldownMs: 60_000 });
+    registry.updateFromServices([makeService()]);
+
+    registry.markEndpointFailure("https://a.example.com");
+    const first = registry.nextEndpoint("api");
+    const second = registry.nextEndpoint("api");
+
+    expect(first).toBe("https://b.example.com");
+    expect(second).toBe("https://b.example.com");
+  });
 });

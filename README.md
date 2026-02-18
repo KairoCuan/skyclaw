@@ -22,6 +22,10 @@ It is heavily inspired by `automaton-skyclaw`, but re-targeted so OpenClaw users
 ## Install
 
 ```bash
+# global install
+npm install -g @razroo/skyclaw
+
+# local development
 npm install
 npm run build
 ```
@@ -138,6 +142,11 @@ curl http://127.0.0.1:8790/v1/gateway/my-ts-api/health
 - `SKYCLAW_GATEWAY_HOST`
 - `SKYCLAW_GATEWAY_PORT`
 - `SKYCLAW_GATEWAY_REFRESH_MS`
+- `SKYCLAW_GATEWAY_HEALTH_PROBE_MS`
+- `SKYCLAW_GATEWAY_HEALTH_PATH`
+- `SKYCLAW_GATEWAY_HEALTH_TIMEOUT_MS`
+- `SKYCLAW_GATEWAY_RETRY_ATTEMPTS`
+- `SKYCLAW_GATEWAY_UNHEALTHY_COOLDOWN_MS`
 
 ## Security Notes (MVP)
 
@@ -222,4 +231,6 @@ The service host claims the deployment, starts the process, and reports endpoint
 - Point each gateway to the same coordinator cluster via `SKYCLAW_COORDINATOR_URLS`.
 - Put DNS or anycast in front of gateways for global entry.
 - Gateway does round-robin across running service assignments discovered from coordinators.
+- Gateway actively probes service health endpoints and temporarily ejects unhealthy backends.
+- Gateway retries idempotent requests (`GET/HEAD/OPTIONS`) on alternate backends when upstream fails.
 - If one gateway goes down, clients can fail over to another gateway endpoint.
