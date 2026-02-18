@@ -1,0 +1,24 @@
+{
+  "name": "@razroo/skyclaw",
+  "version": "0.1.0",
+  "description": "Decentralized OpenClaw coordinator and worker network",
+  "type": "module",
+  "bin": {
+    "skyclaw": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.8",
+    "tsx": "^4.19.2",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.8"
+  }
+}
