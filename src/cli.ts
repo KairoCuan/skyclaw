@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { startCoordinatorServer, type PublicApiKey } from "./coordinator/server.js";
+import { gatewayConfigFromEnv, startGatewayServer } from "./gateway/server.js";
 import { hostConfigFromEnv, parseCoordinatorUrlsFromEnv, startHostDaemon } from "./host/daemon.js";
 import { parseIntEnv } from "./util.js";
 
@@ -8,6 +9,7 @@ function printHelp(): void {
   process.stdout.write(`Usage:\n`);
   process.stdout.write(`  skyclaw coordinator\n`);
   process.stdout.write(`  skyclaw host\n`);
+  process.stdout.write(`  skyclaw gateway\n`);
   process.stdout.write(`  skyclaw enqueue-shell <command> [args...]\n`);
   process.stdout.write(`  skyclaw enqueue-openclaw [openclaw args...]\n`);
   process.stdout.write(`  skyclaw deploy-service <name> <command> [args...]\n`);
@@ -29,6 +31,8 @@ function printHelp(): void {
   process.stdout.write(`  SKYCLAW_SERVICE_BASE_PORT=3100\n`);
   process.stdout.write(`  SKYCLAW_SERVICE_HOST_PUBLIC_BASE_URL=http://<host>\n`);
   process.stdout.write(`  SKYCLAW_DB_PATH=.skyclaw/coordinator.db\n`);
+  process.stdout.write(`  SKYCLAW_GATEWAY_PORT=8790\n`);
+  process.stdout.write(`  SKYCLAW_GATEWAY_REFRESH_MS=3000\n`);
 }
 
 function parsePublicApiKeysFromEnv(): PublicApiKey[] {
@@ -153,6 +157,12 @@ async function main(): Promise<void> {
 
   if (command === "host") {
     await startHostDaemon(hostConfigFromEnv());
+    return;
+  }
+
+  if (command === "gateway") {
+    const coordinatorUrls = parseCoordinatorUrlsFromEnv();
+    await startGatewayServer(gatewayConfigFromEnv(coordinatorUrls));
     return;
   }
 

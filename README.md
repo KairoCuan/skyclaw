@@ -82,6 +82,20 @@ node dist/cli.js deploy-service my-ts-api node dist/server.js
 node dist/cli.js list-services
 ```
 
+6. Start one or more federated gateways:
+
+```bash
+export SKYCLAW_COORDINATOR_URLS=http://127.0.0.1:8787,http://127.0.0.1:8788
+export SKYCLAW_GATEWAY_PORT=8790
+node dist/cli.js gateway
+```
+
+Call service through gateway:
+
+```bash
+curl http://127.0.0.1:8790/v1/gateway/my-ts-api/health
+```
+
 ## API
 
 - `POST /v1/hosts/register`
@@ -97,6 +111,7 @@ node dist/cli.js list-services
 - `GET /v1/services/:id`
 - `POST /v1/hosts/:id/services/claim`
 - `POST /v1/services/:id/report`
+- `ANY /v1/gateway/:serviceName/*` (gateway process)
 - `POST /v1/public/jobs`
 - `GET /v1/public/jobs/:id`
 - `GET /v1/state`
@@ -120,6 +135,9 @@ node dist/cli.js list-services
 - `SKYCLAW_SERVICE_HOST_ENABLED`
 - `SKYCLAW_SERVICE_BASE_PORT`
 - `SKYCLAW_SERVICE_HOST_PUBLIC_BASE_URL`
+- `SKYCLAW_GATEWAY_HOST`
+- `SKYCLAW_GATEWAY_PORT`
+- `SKYCLAW_GATEWAY_REFRESH_MS`
 
 ## Security Notes (MVP)
 
@@ -197,3 +215,11 @@ node dist/cli.js deploy-service my-ts-api node dist/server.js
 ```
 
 The service host claims the deployment, starts the process, and reports endpoint metadata back to the coordinator. Frontends can call those endpoints directly (recommended via your own API gateway/domain).
+
+## Federated Gateways
+
+- Run multiple `skyclaw gateway` instances by different operators.
+- Point each gateway to the same coordinator cluster via `SKYCLAW_COORDINATOR_URLS`.
+- Put DNS or anycast in front of gateways for global entry.
+- Gateway does round-robin across running service assignments discovered from coordinators.
+- If one gateway goes down, clients can fail over to another gateway endpoint.
