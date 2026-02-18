@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { HostRecord, JobRecord } from "../types.js";
+import type { HostRecord, JobRecord, ServiceRecord } from "../types.js";
 
 export interface StoredIdempotencyRecord {
   route: string;
@@ -35,6 +35,14 @@ export class CoordinatorStorage {
       );
 
       CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at);
+
+      CREATE TABLE IF NOT EXISTS services (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        json TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_services_created_at ON services(created_at);
 
       CREATE TABLE IF NOT EXISTS idempotency (
         route TEXT NOT NULL,
@@ -77,11 +85,27 @@ export class CoordinatorStorage {
       .run(job.id, job.createdAt, JSON.stringify(job));
   }
 
-  replaceAll(hosts: HostRecord[], jobs: JobRecord[]): void {
+  loadServices(): ServiceRecord[] {
+    const rows = this.db
+      .prepare("SELECT json FROM services ORDER BY created_at ASC")
+      .all() as Array<{ json: string }>;
+    return rows.map((row) => JSON.parse(row.json) as ServiceRecord);
+  }
+
+  saveService(service: ServiceRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO services (id, created_at, json) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET created_at=excluded.created_at, json=excluded.json`
+      )
+      .run(service.id, service.createdAt, JSON.stringify(service));
+  }
+
+  replaceAll(hosts: HostRecord[], jobs: JobRecord[], services: ServiceRecord[]): void {
     this.db.exec("BEGIN IMMEDIATE;");
     try {
       this.db.exec("DELETE FROM hosts;");
       this.db.exec("DELETE FROM jobs;");
+      this.db.exec("DELETE FROM services;");
 
       const insertHost = this.db.prepare("INSERT INTO hosts (id, json) VALUES (?, ?)");
       for (const host of hosts) {
@@ -91,6 +115,13 @@ export class CoordinatorStorage {
       const insertJob = this.db.prepare("INSERT INTO jobs (id, created_at, json) VALUES (?, ?, ?)");
       for (const job of jobs) {
         insertJob.run(job.id, job.createdAt, JSON.stringify(job));
+      }
+
+      const insertService = this.db.prepare(
+        "INSERT INTO services (id, created_at, json) VALUES (?, ?, ?)"
+      );
+      for (const service of services) {
+        insertService.run(service.id, service.createdAt, JSON.stringify(service));
       }
 
       this.db.exec("COMMIT;");

@@ -6,7 +6,11 @@ import type {
   CoordinatorSnapshot,
   EnqueueJobRequest,
   HeartbeatRequest,
-  RegisterHostRequest
+  JobRecord,
+  PublicSubmitJobRequest,
+  RegisterHostRequest,
+  ServiceDeployRequest,
+  ServiceReportRequest
 } from "../types.js";
 import { readJson, sendError, sendJson } from "../http.js";
 import { normalizeMinReplicas, requiredPeerReplications } from "./replication-policy.js";
@@ -25,11 +29,54 @@ export interface CoordinatorServerOptions {
   idempotencyTtlMs?: number;
   publicUrl?: string;
   peerDiscoveryEnabled?: boolean;
+  publicApiKeys?: PublicApiKey[];
+  publicCorsOrigin?: string;
+}
+
+export interface PublicApiKey {
+  key: string;
+  label?: string;
+  allowedCapabilities?: string[];
+  allowShell?: boolean;
 }
 
 function checkAuth(reqToken: string | undefined, configured: string | undefined): boolean {
   if (!configured) return true;
   return reqToken === configured;
+}
+
+function normalizeOrigin(origin: string | undefined): string {
+  const trimmed = origin?.trim();
+  return trimmed ? trimmed : "*";
+}
+
+function setCorsHeaders(res: import("node:http").ServerResponse, origin: string): void {
+  res.setHeader("access-control-allow-origin", origin);
+  res.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
+  res.setHeader("access-control-allow-headers", "content-type,authorization,x-api-key,x-idempotency-key");
+}
+
+function readBearerOrApiKey(req: IncomingMessage): string | undefined {
+  const authorization = req.headers.authorization;
+  const rawAuth = Array.isArray(authorization) ? authorization[0] : authorization;
+  if (rawAuth?.startsWith("Bearer ")) {
+    const value = rawAuth.slice("Bearer ".length).trim();
+    if (value) return value;
+  }
+  const apiKeyHeader = req.headers["x-api-key"];
+  const rawApiKey = Array.isArray(apiKeyHeader) ? apiKeyHeader[0] : apiKeyHeader;
+  const candidate = rawApiKey?.trim();
+  return candidate || undefined;
+}
+
+function resolvePublicApiKey(
+  req: IncomingMessage,
+  rules: PublicApiKey[]
+): PublicApiKey | undefined {
+  if (rules.length === 0) return undefined;
+  const key = readBearerOrApiKey(req);
+  if (!key) return undefined;
+  return rules.find((rule) => rule.key === key);
 }
 
 function normalizeBaseUrl(url: string | undefined): string | undefined {
@@ -67,6 +114,8 @@ export async function startCoordinatorServer(options: CoordinatorServerOptions):
   const selfPublicUrl = normalizeBaseUrl(options.publicUrl);
   const peerSet = buildInitialPeerSet(options.peerUrls, selfPublicUrl);
   const idempotencyTtlMs = options.idempotencyTtlMs ?? 24 * 60 * 60 * 1000;
+  const publicApiKeys = options.publicApiKeys ?? [];
+  const publicCorsOrigin = normalizeOrigin(options.publicCorsOrigin);
 
   setInterval(() => {
     state.requeueExpiredLeases();
@@ -89,13 +138,6 @@ export async function startCoordinatorServer(options: CoordinatorServerOptions):
 
   const server = createServer(async (req, res) => {
     try {
-      const token = req.headers["x-skyclaw-token"];
-      const providedToken = Array.isArray(token) ? token[0] : token;
-      if (!checkAuth(providedToken, options.authToken)) {
-        sendError(res, 401, "unauthorized");
-        return;
-      }
-
       if (!req.url || !req.method) {
         sendError(res, 400, "invalid request");
         return;
@@ -103,6 +145,31 @@ export async function startCoordinatorServer(options: CoordinatorServerOptions):
 
       const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
       const { pathname } = url;
+      const isPublicApiRoute = pathname === "/v1/public/jobs" || pathname.startsWith("/v1/public/jobs/");
+
+      if (isPublicApiRoute) {
+        setCorsHeaders(res, publicCorsOrigin);
+      }
+
+      if (req.method === "OPTIONS" && isPublicApiRoute) {
+        res.statusCode = 204;
+        res.end();
+        return;
+      }
+
+      if (isPublicApiRoute) {
+        if (publicApiKeys.length === 0) {
+          sendError(res, 503, "public api is disabled");
+          return;
+        }
+      } else {
+        const token = req.headers["x-skyclaw-token"];
+        const providedToken = Array.isArray(token) ? token[0] : token;
+        if (!checkAuth(providedToken, options.authToken)) {
+          sendError(res, 401, "unauthorized");
+          return;
+        }
+      }
 
       if (req.method === "GET" && pathname === "/health") {
         sendJson(res, 200, { ok: true, nodeId: state.getNodeId() });
@@ -237,6 +304,208 @@ export async function startCoordinatorServer(options: CoordinatorServerOptions):
               () => state.enqueueJob(body)
             ),
           (job) => ({ job })
+        );
+        if (applied.kind === "conflict") {
+          sendError(res, 409, applied.error);
+          return;
+        }
+        if (applied.kind === "error") {
+          sendError(res, 503, applied.error);
+          return;
+        }
+        sendJson(res, applied.statusCode, applied.body);
+        return;
+      }
+
+      if (req.method === "POST" && pathname === "/v1/services") {
+        const body = await readJson<ServiceDeployRequest>(req);
+        if (!body.name?.trim()) {
+          sendError(res, 400, "name is required");
+          return;
+        }
+        if (!body.command?.trim()) {
+          sendError(res, 400, "command is required");
+          return;
+        }
+        const applied = await applyIdempotentMutation(
+          req,
+          state,
+          "/v1/services",
+          body,
+          idempotencyTtlMs,
+          () =>
+            applyMutationWithQuorum(
+              state,
+              [...peerSet.values()],
+              options.authToken,
+              requiredPeerAcks,
+              () => state.deployService(body)
+            ),
+          (service) => ({ service })
+        );
+        if (applied.kind === "conflict") {
+          sendError(res, 409, applied.error);
+          return;
+        }
+        if (applied.kind === "error") {
+          sendError(res, 503, applied.error);
+          return;
+        }
+        sendJson(res, applied.statusCode, applied.body);
+        return;
+      }
+
+      if (req.method === "GET" && pathname === "/v1/services") {
+        sendJson(res, 200, { services: state.listServices() });
+        return;
+      }
+
+      const serviceGetMatch = pathname.match(/^\/v1\/services\/([^/]+)$/);
+      if (req.method === "GET" && serviceGetMatch) {
+        const serviceId = decodeURIComponent(serviceGetMatch[1]);
+        const service = state.getService(serviceId);
+        if (!service) {
+          sendError(res, 404, "service not found");
+          return;
+        }
+        sendJson(res, 200, { service });
+        return;
+      }
+
+      if (req.method === "POST" && pathname === "/v1/public/jobs") {
+        const apiKey = resolvePublicApiKey(req, publicApiKeys);
+        if (!apiKey) {
+          sendError(res, 401, "invalid api key");
+          return;
+        }
+
+        const body = await readJson<PublicSubmitJobRequest>(req);
+        if (!body.payload || !body.payload.kind) {
+          sendError(res, 400, "payload is required");
+          return;
+        }
+
+        const allowedCapabilities = apiKey.allowedCapabilities?.length
+          ? apiKey.allowedCapabilities
+          : ["openclaw"];
+        const requestedCapabilities = body.requirement?.requiredCapabilities ?? [];
+        if (!requestedCapabilities.every((cap) => allowedCapabilities.includes(cap))) {
+          sendError(res, 403, "requested capabilities are not allowed for this api key");
+          return;
+        }
+
+        if (body.payload.kind === "shell" && !apiKey.allowShell) {
+          sendError(res, 403, "shell jobs are not allowed for this api key");
+          return;
+        }
+
+        const enqueueRequest: EnqueueJobRequest = {
+          payload: body.payload,
+          requirement: body.requirement ?? { requiredCapabilities: allowedCapabilities },
+          submittedBy: toPublicSubmitterId(apiKey)
+        };
+
+        const applied = await applyIdempotentMutation(
+          req,
+          state,
+          "/v1/public/jobs",
+          enqueueRequest,
+          idempotencyTtlMs,
+          () =>
+            applyMutationWithQuorum(
+              state,
+              [...peerSet.values()],
+              options.authToken,
+              requiredPeerAcks,
+              () => state.enqueueJob(enqueueRequest)
+            ),
+          (job) => ({ job: toPublicJobResponse(job) })
+        );
+        if (applied.kind === "conflict") {
+          sendError(res, 409, applied.error);
+          return;
+        }
+        if (applied.kind === "error") {
+          sendError(res, 503, applied.error);
+          return;
+        }
+        sendJson(res, applied.statusCode, applied.body);
+        return;
+      }
+
+      const publicJobMatch = pathname.match(/^\/v1\/public\/jobs\/([^/]+)$/);
+      if (req.method === "GET" && publicJobMatch) {
+        const apiKey = resolvePublicApiKey(req, publicApiKeys);
+        if (!apiKey) {
+          sendError(res, 401, "invalid api key");
+          return;
+        }
+        const jobId = decodeURIComponent(publicJobMatch[1]);
+        const job = state.getJob(jobId);
+        if (!job) {
+          sendError(res, 404, "job not found");
+          return;
+        }
+        if (job.submittedBy !== toPublicSubmitterId(apiKey)) {
+          sendError(res, 404, "job not found");
+          return;
+        }
+        sendJson(res, 200, { job: toPublicJobResponse(job) });
+        return;
+      }
+
+      const serviceClaimMatch = pathname.match(/^\/v1\/hosts\/([^/]+)\/services\/claim$/);
+      if (req.method === "POST" && serviceClaimMatch) {
+        const hostId = decodeURIComponent(serviceClaimMatch[1]);
+        const claimBody = await readJson<Record<string, unknown>>(req);
+        const route = `/v1/hosts/${hostId}/services/claim`;
+        const applied = await applyIdempotentMutation(
+          req,
+          state,
+          route,
+          claimBody,
+          idempotencyTtlMs,
+          () =>
+            applyMutationWithQuorum(
+              state,
+              [...peerSet.values()],
+              options.authToken,
+              requiredPeerAcks,
+              () => state.claimService(hostId)
+            ),
+          (claimResponse) => claimResponse
+        );
+        if (applied.kind === "conflict") {
+          sendError(res, 409, applied.error);
+          return;
+        }
+        if (applied.kind === "error") {
+          sendError(res, 503, applied.error);
+          return;
+        }
+        sendJson(res, applied.statusCode, applied.body);
+        return;
+      }
+
+      const serviceReportMatch = pathname.match(/^\/v1\/services\/([^/]+)\/report$/);
+      if (req.method === "POST" && serviceReportMatch) {
+        const serviceId = decodeURIComponent(serviceReportMatch[1]);
+        const body = await readJson<ServiceReportRequest>(req);
+        const applied = await applyIdempotentMutation(
+          req,
+          state,
+          `/v1/services/${serviceId}/report`,
+          body,
+          idempotencyTtlMs,
+          () =>
+            applyMutationWithQuorum(
+              state,
+              [...peerSet.values()],
+              options.authToken,
+              requiredPeerAcks,
+              () => state.reportService(serviceId, body)
+            ),
+          (service) => ({ service })
         );
         if (applied.kind === "conflict") {
           sendError(res, 409, applied.error);
@@ -480,6 +749,15 @@ function sortJsonValue(value: unknown): unknown {
     return out;
   }
   return value;
+}
+
+function toPublicSubmitterId(apiKey: PublicApiKey): string {
+  return `public:${apiKey.label || "anonymous"}`;
+}
+
+function toPublicJobResponse(job: JobRecord): Omit<JobRecord, "submittedBy"> {
+  const { submittedBy: _submittedBy, ...rest } = job;
+  return rest;
 }
 
 async function syncFromPeers(state: CoordinatorState, peerUrls: string[], token?: string): Promise<void> {

@@ -69,6 +69,47 @@ describe("CoordinatorState", () => {
     expect(completed.result?.stdout).toBe("ok\n");
   });
 
+  it("stores submitter identity and allows job lookup", () => {
+    const state = new CoordinatorState();
+    const job = state.enqueueJob({
+      payload: { kind: "openclaw-run", args: ["run"] },
+      requirement: { requiredCapabilities: ["openclaw"] },
+      submittedBy: "public:website"
+    });
+
+    const loaded = state.getJob(job.id);
+    expect(loaded?.submittedBy).toBe("public:website");
+  });
+
+  it("deploys, claims, and reports service status", () => {
+    const state = new CoordinatorState();
+    const host = state.registerHost({
+      name: "service-host-1",
+      capabilities: ["service-host"],
+      maxParallel: 1
+    });
+
+    const service = state.deployService({
+      name: "ts-api",
+      command: "node",
+      args: ["server.js"],
+      replicas: 1,
+      requiredCapabilities: ["service-host"]
+    });
+    expect(service.status).toBe("pending");
+
+    const claim = state.claimService(host.id);
+    expect(claim.service?.id).toBe(service.id);
+
+    const running = state.reportService(service.id, {
+      hostId: host.id,
+      status: "running",
+      endpoint: "https://node-a.example.com:3100"
+    });
+    expect(running.status).toBe("running");
+    expect(running.assignments[0]?.endpoint).toContain("3100");
+  });
+
   it("reloads state from sqlite after restart", async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "skyclaw-state-"));
     const dbPath = path.join(tmpDir, "coordinator.db");

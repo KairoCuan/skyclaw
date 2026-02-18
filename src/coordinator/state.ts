@@ -5,7 +5,11 @@ import type {
   EnqueueJobRequest,
   HostRecord,
   JobRecord,
-  RegisterHostRequest
+  RegisterHostRequest,
+  ServiceClaimResponse,
+  ServiceDeployRequest,
+  ServiceRecord,
+  ServiceReportRequest
 } from "../types.js";
 import { hasCapabilities, makeId, normalizeCapabilities, nowIso } from "../util.js";
 import { CoordinatorStorage } from "./storage.js";
@@ -20,6 +24,7 @@ export interface CoordinatorStateOptions {
 export class CoordinatorState {
   private readonly hosts = new Map<string, HostRecord>();
   private readonly jobs = new Map<string, JobRecord>();
+  private readonly services = new Map<string, ServiceRecord>();
   private readonly leaseMs: number;
   private readonly storage?: CoordinatorStorage;
   private readonly nodeId: string;
@@ -36,9 +41,16 @@ export class CoordinatorState {
       for (const job of this.storage.loadJobs()) {
         this.jobs.set(job.id, job);
       }
+      for (const service of this.storage.loadServices()) {
+        this.services.set(service.id, service);
+      }
       const maxHostVersion = Math.max(0, ...[...this.hosts.values()].map((host) => host.version || 0));
       const maxJobVersion = Math.max(0, ...[...this.jobs.values()].map((job) => job.version || 0));
-      this.nextVersion = Math.max(maxHostVersion, maxJobVersion) + 1;
+      const maxServiceVersion = Math.max(
+        0,
+        ...[...this.services.values()].map((service) => service.version || 0)
+      );
+      this.nextVersion = Math.max(maxHostVersion, maxJobVersion, maxServiceVersion) + 1;
     }
   }
 
@@ -92,7 +104,8 @@ export class CoordinatorState {
       requirement: {
         requiredCapabilities: normalizeCapabilities(input.requirement?.requiredCapabilities)
       },
-      payload: input.payload
+      payload: input.payload,
+      submittedBy: input.submittedBy?.trim() || undefined
     };
     this.jobs.set(record.id, record);
     this.storage?.saveJob(record);
@@ -169,6 +182,102 @@ export class CoordinatorState {
     return structuredClone(job);
   }
 
+  deployService(input: ServiceDeployRequest): ServiceRecord {
+    const now = nowIso();
+    const id = input.serviceId?.trim() || makeId("svc");
+    const record: ServiceRecord = {
+      id,
+      name: input.name.trim(),
+      command: input.command.trim(),
+      args: input.args ?? [],
+      cwd: input.cwd,
+      env: input.env,
+      replicas: Math.max(1, input.replicas ?? 1),
+      requiredCapabilities: normalizeCapabilities(input.requiredCapabilities ?? ["service-host"]),
+      status: "pending",
+      createdAt: now,
+      updatedAt: now,
+      updatedBy: this.nodeId,
+      version: this.bumpVersion(),
+      assignments: []
+    };
+    this.services.set(record.id, record);
+    this.storage?.saveService(record);
+    return structuredClone(record);
+  }
+
+  listServices(): ServiceRecord[] {
+    return [...this.services.values()]
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .map((service) => structuredClone(service));
+  }
+
+  getService(serviceId: string): ServiceRecord | undefined {
+    const service = this.services.get(serviceId);
+    return service ? structuredClone(service) : undefined;
+  }
+
+  claimService(hostId: string): ServiceClaimResponse {
+    const host = this.hosts.get(hostId);
+    if (!host) {
+      throw new Error(`unknown host: ${hostId}`);
+    }
+
+    const candidates = [...this.services.values()]
+      .filter((service) => hasCapabilities(host.capabilities, service.requiredCapabilities))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+
+    for (const service of candidates) {
+      const existing = service.assignments.find((assignment) => assignment.hostId === hostId);
+      if (existing) {
+        if (existing.status === "failed") {
+          continue;
+        }
+        return { service: structuredClone(service) };
+      }
+      if (service.assignments.length >= service.replicas) {
+        continue;
+      }
+
+      service.assignments.push({
+        hostId,
+        status: "pending",
+        updatedAt: nowIso()
+      });
+      this.touchService(service);
+      return { service: structuredClone(service) };
+    }
+
+    return { service: null };
+  }
+
+  reportService(serviceId: string, input: ServiceReportRequest): ServiceRecord {
+    const service = this.services.get(serviceId);
+    if (!service) {
+      throw new Error(`unknown service: ${serviceId}`);
+    }
+    const assignment = service.assignments.find((item) => item.hostId === input.hostId);
+    if (!assignment) {
+      throw new Error(`service ${serviceId} is not assigned to host ${input.hostId}`);
+    }
+    assignment.status = input.status;
+    assignment.endpoint = input.endpoint;
+    assignment.error = input.error;
+    assignment.updatedAt = nowIso();
+    if (input.status === "running" && !assignment.startedAt) {
+      assignment.startedAt = nowIso();
+    }
+    if (service.assignments.some((item) => item.status === "running")) {
+      service.status = "running";
+    } else if (service.assignments.some((item) => item.status === "pending")) {
+      service.status = "pending";
+    } else {
+      service.status = "failed";
+    }
+    this.touchService(service);
+    return structuredClone(service);
+  }
+
   requeueExpiredLeases(): number {
     const now = Date.now();
     let requeued = 0;
@@ -218,6 +327,17 @@ export class CoordinatorState {
       }
     }
 
+    for (const incomingService of snapshot.services || []) {
+      const current = this.services.get(incomingService.id);
+      if (!current || shouldAdopt(current, incomingService)) {
+        const adopted = structuredClone(incomingService);
+        this.services.set(adopted.id, adopted);
+        this.storage?.saveService(adopted);
+        this.nextVersion = Math.max(this.nextVersion, (adopted.version || 0) + 1);
+        changed = true;
+      }
+    }
+
     return { changed };
   }
 
@@ -233,6 +353,7 @@ export class CoordinatorState {
   restore(snapshot: CoordinatorSnapshot): void {
     this.hosts.clear();
     this.jobs.clear();
+    this.services.clear();
 
     for (const host of snapshot.hosts || []) {
       this.hosts.set(host.id, structuredClone(host));
@@ -240,17 +361,30 @@ export class CoordinatorState {
     for (const job of snapshot.jobs || []) {
       this.jobs.set(job.id, structuredClone(job));
     }
+    for (const service of snapshot.services || []) {
+      this.services.set(service.id, structuredClone(service));
+    }
 
     const maxHostVersion = Math.max(0, ...[...this.hosts.values()].map((host) => host.version || 0));
     const maxJobVersion = Math.max(0, ...[...this.jobs.values()].map((job) => job.version || 0));
-    this.nextVersion = Math.max(maxHostVersion, maxJobVersion) + 1;
+    const maxServiceVersion = Math.max(
+      0,
+      ...[...this.services.values()].map((service) => service.version || 0)
+    );
+    this.nextVersion = Math.max(maxHostVersion, maxJobVersion, maxServiceVersion) + 1;
 
     if (this.storage) {
       this.storage.replaceAll(
         [...this.hosts.values()].map((host) => structuredClone(host)),
-        [...this.jobs.values()].map((job) => structuredClone(job))
+        [...this.jobs.values()].map((job) => structuredClone(job)),
+        [...this.services.values()].map((service) => structuredClone(service))
       );
     }
+  }
+
+  getJob(jobId: string): JobRecord | undefined {
+    const job = this.jobs.get(jobId);
+    return job ? structuredClone(job) : undefined;
   }
 
   getIdempotency(route: string, key: string): StoredIdempotencyRecord | undefined {
@@ -290,7 +424,10 @@ export class CoordinatorState {
       hosts: [...this.hosts.values()].map((host) => structuredClone(host)),
       jobs: [...this.jobs.values()]
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-        .map((job) => structuredClone(job))
+        .map((job) => structuredClone(job)),
+      services: [...this.services.values()]
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+        .map((service) => structuredClone(service))
     };
   }
 
@@ -311,6 +448,13 @@ export class CoordinatorState {
     job.version = this.bumpVersion();
     job.updatedBy = this.nodeId;
     this.storage?.saveJob(job);
+  }
+
+  private touchService(service: ServiceRecord): void {
+    service.updatedAt = nowIso();
+    service.version = this.bumpVersion();
+    service.updatedBy = this.nodeId;
+    this.storage?.saveService(service);
   }
 }
 

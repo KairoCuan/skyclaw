@@ -1,4 +1,5 @@
 export type JobStatus = "queued" | "leased" | "completed" | "failed";
+export type ServiceStatus = "pending" | "running" | "failed";
 
 export interface JobRequirement {
   requiredCapabilities?: string[];
@@ -35,6 +36,7 @@ export interface JobRecord {
   assignedHostId?: string;
   requirement: JobRequirement;
   payload: JobPayload;
+  submittedBy?: string;
   result?: {
     finishedAt: string;
     durationMs: number;
@@ -75,6 +77,58 @@ export interface HeartbeatRequest {
 export interface EnqueueJobRequest {
   payload: JobPayload;
   requirement?: JobRequirement;
+  submittedBy?: string;
+}
+
+export interface PublicSubmitJobRequest {
+  payload: JobPayload;
+  requirement?: JobRequirement;
+}
+
+export interface ServiceDeployRequest {
+  serviceId?: string;
+  name: string;
+  command: string;
+  args?: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+  replicas?: number;
+  requiredCapabilities?: string[];
+}
+
+export interface ServiceRecord {
+  id: string;
+  name: string;
+  command: string;
+  args: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+  replicas: number;
+  requiredCapabilities: string[];
+  status: ServiceStatus;
+  createdAt: string;
+  updatedAt: string;
+  updatedBy: string;
+  version: number;
+  assignments: Array<{
+    hostId: string;
+    status: ServiceStatus;
+    endpoint?: string;
+    error?: string;
+    startedAt?: string;
+    updatedAt: string;
+  }>;
+}
+
+export interface ServiceClaimResponse {
+  service: ServiceRecord | null;
+}
+
+export interface ServiceReportRequest {
+  hostId: string;
+  status: ServiceStatus;
+  endpoint?: string;
+  error?: string;
 }
 
 export interface ClaimJobResponse {
@@ -95,4 +149,5 @@ export interface CoordinatorSnapshot {
   nodeId?: string;
   hosts: HostRecord[];
   jobs: JobRecord[];
+  services?: ServiceRecord[];
 }

@@ -1,4 +1,11 @@
-import type { HostRecord, JobRecord, RegisterHostResponse } from "../types.js";
+import { spawn, type ChildProcess } from "node:child_process";
+import path from "node:path";
+import type {
+  HostRecord,
+  JobRecord,
+  RegisterHostResponse,
+  ServiceRecord
+} from "../types.js";
 import { parseIntEnv } from "../util.js";
 import { runJob, type HostExecutionConfig } from "./runner.js";
 
@@ -12,6 +19,11 @@ export interface HostDaemonConfig {
   pollIntervalMs: number;
   heartbeatIntervalMs: number;
   execution: HostExecutionConfig;
+  serviceRuntime: {
+    enabled: boolean;
+    basePort: number;
+    hostPublicBaseUrl?: string;
+  };
 }
 
 class CoordinatorClient {
@@ -22,14 +34,14 @@ class CoordinatorClient {
     private readonly token?: string
   ) {}
 
-  async postJson<T>(path: string, body: unknown): Promise<T> {
+  async postJson<T>(pathKey: string, body: unknown): Promise<T> {
     let lastError: unknown;
 
     for (let i = 0; i < this.urls.length; i += 1) {
       const index = (this.activeIndex + i) % this.urls.length;
       const baseUrl = this.urls[index];
       try {
-        const response = await fetch(`${baseUrl}${path}`, {
+        const response = await fetch(`${baseUrl}${pathKey}`, {
           method: "POST",
           headers: {
             "content-type": "application/json",
@@ -53,6 +65,11 @@ class CoordinatorClient {
   }
 }
 
+interface ServiceProcess {
+  process: ChildProcess;
+  endpoint?: string;
+}
+
 export async function startHostDaemon(config: HostDaemonConfig): Promise<void> {
   if (config.coordinatorUrls.length === 0) {
     throw new Error("at least one coordinator URL is required");
@@ -69,6 +86,8 @@ export async function startHostDaemon(config: HostDaemonConfig): Promise<void> {
   let host: HostRecord = registerRes.host;
   process.stdout.write(`[skyclaw] host registered: ${host.id} (${host.name})\n`);
 
+  const serviceProcesses = new Map<string, ServiceProcess>();
+
   setInterval(async () => {
     try {
       const next = await client.postJson<{ host: HostRecord }>(
@@ -81,6 +100,12 @@ export async function startHostDaemon(config: HostDaemonConfig): Promise<void> {
       process.stderr.write(`[skyclaw] heartbeat failed: ${msg}\n`);
     }
   }, config.heartbeatIntervalMs).unref();
+
+  if (config.serviceRuntime.enabled) {
+    setInterval(() => {
+      void claimAndRunServices(client, host.id, serviceProcesses, config);
+    }, config.pollIntervalMs).unref();
+  }
 
   for (;;) {
     try {
@@ -121,17 +146,81 @@ export async function startHostDaemon(config: HostDaemonConfig): Promise<void> {
   }
 }
 
+async function claimAndRunServices(
+  client: CoordinatorClient,
+  hostId: string,
+  serviceProcesses: Map<string, ServiceProcess>,
+  config: HostDaemonConfig
+): Promise<void> {
+  try {
+    const claim = await client.postJson<{ service: ServiceRecord | null }>(
+      `/v1/hosts/${encodeURIComponent(hostId)}/services/claim`,
+      {}
+    );
+    if (!claim.service) {
+      return;
+    }
+
+    const existing = serviceProcesses.get(claim.service.id);
+    if (existing && !existing.process.killed) {
+      await client.postJson(`/v1/services/${encodeURIComponent(claim.service.id)}/report`, {
+        hostId,
+        status: "running",
+        endpoint: existing.endpoint
+      });
+      return;
+    }
+
+    const port = config.serviceRuntime.basePort + serviceProcesses.size;
+    const endpoint = config.serviceRuntime.hostPublicBaseUrl
+      ? `${config.serviceRuntime.hostPublicBaseUrl.replace(/\/$/, "")}:${port}`
+      : undefined;
+
+    const child = spawn(claim.service.command, claim.service.args, {
+      cwd: claim.service.cwd ? path.resolve(claim.service.cwd) : process.cwd(),
+      env: {
+        ...process.env,
+        ...(claim.service.env || {}),
+        PORT: String(port)
+      },
+      stdio: "inherit"
+    });
+
+    serviceProcesses.set(claim.service.id, { process: child, endpoint });
+
+    await client.postJson(`/v1/services/${encodeURIComponent(claim.service.id)}/report`, {
+      hostId,
+      status: "running",
+      endpoint
+    });
+
+    child.on("exit", async (code) => {
+      serviceProcesses.delete(claim.service!.id);
+      await client
+        .postJson(`/v1/services/${encodeURIComponent(claim.service!.id)}/report`, {
+          hostId,
+          status: "failed",
+          error: `service process exited with code ${code ?? -1}`
+        })
+        .catch(() => undefined);
+    });
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`[skyclaw] service claim loop error: ${msg}\n`);
+  }
+}
+
 export function hostConfigFromEnv(): HostDaemonConfig {
   const coordinatorUrls = parseCoordinatorUrlsFromEnv();
   const token = process.env.SKYCLAW_TOKEN;
   const hostName = process.env.SKYCLAW_HOST_NAME || `openclaw-node-${process.pid}`;
   const hostId = process.env.SKYCLAW_HOST_ID;
-  const capabilities = (process.env.SKYCLAW_CAPABILITIES || "shell,openclaw")
+  const capabilities = (process.env.SKYCLAW_CAPABILITIES || "shell,openclaw,service-host")
     .split(",")
     .map((v) => v.trim())
     .filter(Boolean);
 
-  const allowedCommands = (process.env.SKYCLAW_ALLOWED_COMMANDS || "openclaw,node,bash,sh")
+  const allowedCommands = (process.env.SKYCLAW_ALLOWED_COMMANDS || "openclaw,node,bash,sh,npm,pnpm")
     .split(",")
     .map((v) => v.trim())
     .filter(Boolean);
@@ -150,6 +239,11 @@ export function hostConfigFromEnv(): HostDaemonConfig {
       defaultTimeoutMs: parseIntEnv("SKYCLAW_TIMEOUT_MS", 300_000),
       maxOutputBytes: parseIntEnv("SKYCLAW_MAX_OUTPUT_BYTES", 128_000),
       openclawCommand: process.env.SKYCLAW_OPENCLAW_COMMAND || "openclaw"
+    },
+    serviceRuntime: {
+      enabled: process.env.SKYCLAW_SERVICE_HOST_ENABLED !== "0",
+      basePort: parseIntEnv("SKYCLAW_SERVICE_BASE_PORT", 3100),
+      hostPublicBaseUrl: process.env.SKYCLAW_SERVICE_HOST_PUBLIC_BASE_URL
     }
   };
 }

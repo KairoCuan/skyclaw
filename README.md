@@ -72,6 +72,16 @@ node dist/cli.js enqueue-openclaw run
 node dist/cli.js enqueue-shell bash -lc "echo hello from decentralized skyclaw"
 ```
 
+5. Deploy a TypeScript API service to the network:
+
+```bash
+# Example: run compiled TS API with Node
+node dist/cli.js deploy-service my-ts-api node dist/server.js
+
+# inspect service assignments/endpoints
+node dist/cli.js list-services
+```
+
 ## API
 
 - `POST /v1/hosts/register`
@@ -82,6 +92,13 @@ node dist/cli.js enqueue-shell bash -lc "echo hello from decentralized skyclaw"
 - `POST /v1/replicate/snapshot`
 - `GET /v1/network/peers`
 - `POST /v1/network/join`
+- `POST /v1/services`
+- `GET /v1/services`
+- `GET /v1/services/:id`
+- `POST /v1/hosts/:id/services/claim`
+- `POST /v1/services/:id/report`
+- `POST /v1/public/jobs`
+- `GET /v1/public/jobs/:id`
 - `GET /v1/state`
 - `GET /health`
 
@@ -95,9 +112,14 @@ node dist/cli.js enqueue-shell bash -lc "echo hello from decentralized skyclaw"
 - `SKYCLAW_PEER_DISCOVERY` (default `1`)
 - `SKYCLAW_DB_PATH`
 - `SKYCLAW_TOKEN`
+- `SKYCLAW_PUBLIC_API_KEYS`
+- `SKYCLAW_PUBLIC_CORS_ORIGIN`
 - `SKYCLAW_CAPABILITIES`
 - `SKYCLAW_ALLOWED_COMMANDS`
 - `SKYCLAW_OPENCLAW_COMMAND`
+- `SKYCLAW_SERVICE_HOST_ENABLED`
+- `SKYCLAW_SERVICE_BASE_PORT`
+- `SKYCLAW_SERVICE_HOST_PUBLIC_BASE_URL`
 
 ## Security Notes (MVP)
 
@@ -115,3 +137,63 @@ This is an MVP decentralized coordinator/worker layer for OpenClaw.
 - Set a reachable `SKYCLAW_COORDINATOR_PUBLIC_URL` on each coordinator.
 - Coordinators gossip known peers and auto-announce themselves with `/v1/network/join`.
 - As nodes discover each other, the replication peer set expands automatically.
+
+## Website API with Auth
+
+You can expose a website-facing API on your coordinator using scoped API keys.
+
+1. Configure public API keys and CORS:
+
+```bash
+export SKYCLAW_PUBLIC_API_KEYS="site-key-prod:site:openclaw,admin-key:admin:openclaw|shell:shell"
+export SKYCLAW_PUBLIC_CORS_ORIGIN=https://your-site.com
+```
+
+Format for `SKYCLAW_PUBLIC_API_KEYS` entries:
+
+- `<key>:<label>:<cap1|cap2>[:shell]`
+- `:shell` is optional; include it only if that key may submit `shell` jobs.
+- If omitted, capabilities default to `openclaw`.
+
+2. Submit jobs from your website backend or frontend:
+
+```bash
+curl -X POST http://127.0.0.1:8787/v1/public/jobs \
+  -H "Authorization: Bearer site-key-prod" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "payload": { "kind": "openclaw-run", "args": ["run"] },
+    "requirement": { "requiredCapabilities": ["openclaw"] }
+  }'
+```
+
+3. Poll job status:
+
+```bash
+curl http://127.0.0.1:8787/v1/public/jobs/<job-id> \
+  -H "Authorization: Bearer site-key-prod"
+```
+
+Notes:
+
+- Public routes accept `Authorization: Bearer <key>` or `x-api-key`.
+- Jobs are isolated by submitter key label; one key cannot fetch another key's jobs.
+- Use a reverse proxy/TLS in front of coordinators for production websites.
+
+## Deploying a TS API on the network
+
+To run deployable API processes on hosts, ensure host nodes include the `service-host` capability (default in this repo) and set a reachable base URL:
+
+```bash
+export SKYCLAW_SERVICE_HOST_ENABLED=1
+export SKYCLAW_SERVICE_BASE_PORT=3100
+export SKYCLAW_SERVICE_HOST_PUBLIC_BASE_URL=https://node-a.example.com
+```
+
+Then deploy:
+
+```bash
+node dist/cli.js deploy-service my-ts-api node dist/server.js
+```
+
+The service host claims the deployment, starts the process, and reports endpoint metadata back to the coordinator. Frontends can call those endpoints directly (recommended via your own API gateway/domain).
