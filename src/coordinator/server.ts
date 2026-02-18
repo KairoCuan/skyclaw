@@ -9,11 +9,7 @@ import type {
   RegisterHostRequest
 } from "../types.js";
 import { readJson, sendError, sendJson } from "../http.js";
-import {
-  assertPeerCapacity,
-  normalizeMinReplicas,
-  requiredPeerReplications
-} from "./replication-policy.js";
+import { normalizeMinReplicas, requiredPeerReplications } from "./replication-policy.js";
 import { CoordinatorState } from "./state.js";
 
 export interface CoordinatorServerOptions {
@@ -27,6 +23,8 @@ export interface CoordinatorServerOptions {
   peerSyncIntervalMs?: number;
   minReplicas?: number;
   idempotencyTtlMs?: number;
+  publicUrl?: string;
+  peerDiscoveryEnabled?: boolean;
 }
 
 function checkAuth(reqToken: string | undefined, configured: string | undefined): boolean {
@@ -34,14 +32,26 @@ function checkAuth(reqToken: string | undefined, configured: string | undefined)
   return reqToken === configured;
 }
 
-function normalizePeerUrls(urls: string[] | undefined, ownPort: number): string[] {
-  if (!urls?.length) return [];
-  const ownLocal = new Set([
-    `http://127.0.0.1:${ownPort}`,
-    `http://localhost:${ownPort}`,
-    `http://0.0.0.0:${ownPort}`
-  ]);
-  return [...new Set(urls.map((url) => url.trim()).filter(Boolean))].filter((url) => !ownLocal.has(url));
+function normalizeBaseUrl(url: string | undefined): string | undefined {
+  if (!url?.trim()) return undefined;
+  try {
+    const normalized = new URL(url.trim());
+    const pathname = normalized.pathname === "/" ? "" : normalized.pathname.replace(/\/$/, "");
+    return `${normalized.protocol}//${normalized.host}${pathname}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function buildInitialPeerSet(urls: string[] | undefined, selfUrl: string | undefined): Set<string> {
+  const peers = new Set<string>();
+  for (const raw of urls || []) {
+    const normalized = normalizeBaseUrl(raw);
+    if (!normalized) continue;
+    if (normalized === selfUrl) continue;
+    peers.add(normalized);
+  }
+  return peers;
 }
 
 export async function startCoordinatorServer(options: CoordinatorServerOptions): Promise<void> {
@@ -52,23 +62,30 @@ export async function startCoordinatorServer(options: CoordinatorServerOptions):
     dbPath: options.dbPath,
     nodeId: options.nodeId
   });
-  const peerUrls = normalizePeerUrls(options.peerUrls, options.port);
+
+  const peerDiscoveryEnabled = options.peerDiscoveryEnabled ?? true;
+  const selfPublicUrl = normalizeBaseUrl(options.publicUrl);
+  const peerSet = buildInitialPeerSet(options.peerUrls, selfPublicUrl);
   const idempotencyTtlMs = options.idempotencyTtlMs ?? 24 * 60 * 60 * 1000;
-  assertPeerCapacity(minReplicas, peerUrls.length);
 
   setInterval(() => {
     state.requeueExpiredLeases();
   }, 1_000).unref();
+
   setInterval(() => {
     state.purgeExpiredIdempotency();
   }, 60_000).unref();
 
-  if (peerUrls.length > 0) {
-    const syncIntervalMs = options.peerSyncIntervalMs ?? 3_000;
-    setInterval(() => {
-      void syncFromPeers(state, peerUrls, options.authToken);
-    }, syncIntervalMs).unref();
-  }
+  const syncIntervalMs = options.peerSyncIntervalMs ?? 3_000;
+  setInterval(() => {
+    const peers = [...peerSet.values()];
+    if (peers.length > 0) {
+      void syncFromPeers(state, peers, options.authToken);
+    }
+    if (peerDiscoveryEnabled) {
+      void discoverPeers(peerSet, peers, options.authToken, selfPublicUrl);
+    }
+  }, syncIntervalMs).unref();
 
   const server = createServer(async (req, res) => {
     try {
@@ -89,6 +106,34 @@ export async function startCoordinatorServer(options: CoordinatorServerOptions):
 
       if (req.method === "GET" && pathname === "/health") {
         sendJson(res, 200, { ok: true, nodeId: state.getNodeId() });
+        return;
+      }
+
+      if (req.method === "GET" && pathname === "/v1/network/peers") {
+        sendJson(res, 200, {
+          nodeId: state.getNodeId(),
+          self: selfPublicUrl,
+          peers: [...peerSet.values()]
+        });
+        return;
+      }
+
+      if (req.method === "POST" && pathname === "/v1/network/join") {
+        const body = await readJson<{ url?: string }>(req);
+        const candidate = normalizeBaseUrl(body.url);
+        if (!candidate) {
+          sendError(res, 400, "url is required");
+          return;
+        }
+        if (candidate !== selfPublicUrl) {
+          peerSet.add(candidate);
+        }
+        sendJson(res, 200, {
+          ok: true,
+          nodeId: state.getNodeId(),
+          self: selfPublicUrl,
+          peers: [...peerSet.values()]
+        });
         return;
       }
 
@@ -119,7 +164,7 @@ export async function startCoordinatorServer(options: CoordinatorServerOptions):
           () =>
             applyMutationWithQuorum(
               state,
-              peerUrls,
+              [...peerSet.values()],
               options.authToken,
               requiredPeerAcks,
               () => state.registerHost(body)
@@ -152,7 +197,7 @@ export async function startCoordinatorServer(options: CoordinatorServerOptions):
           () =>
             applyMutationWithQuorum(
               state,
-              peerUrls,
+              [...peerSet.values()],
               options.authToken,
               requiredPeerAcks,
               () => state.heartbeat(hostId, body.activeLeases)
@@ -186,7 +231,7 @@ export async function startCoordinatorServer(options: CoordinatorServerOptions):
           () =>
             applyMutationWithQuorum(
               state,
-              peerUrls,
+              [...peerSet.values()],
               options.authToken,
               requiredPeerAcks,
               () => state.enqueueJob(body)
@@ -219,7 +264,7 @@ export async function startCoordinatorServer(options: CoordinatorServerOptions):
           () =>
             applyMutationWithQuorum(
               state,
-              peerUrls,
+              [...peerSet.values()],
               options.authToken,
               requiredPeerAcks,
               () => state.claimJob(hostId)
@@ -251,7 +296,7 @@ export async function startCoordinatorServer(options: CoordinatorServerOptions):
           () =>
             applyMutationWithQuorum(
               state,
-              peerUrls,
+              [...peerSet.values()],
               options.authToken,
               requiredPeerAcks,
               () => state.completeJob(jobId, body)
@@ -288,9 +333,16 @@ export async function startCoordinatorServer(options: CoordinatorServerOptions):
     `[skyclaw] replication policy: min replicas ${minReplicas} (${requiredPeerAcks} peer acks required)\n`
   );
 
-  if (peerUrls.length > 0) {
-    process.stdout.write(`[skyclaw] peers: ${peerUrls.join(", ")}\n`);
-    void syncFromPeers(state, peerUrls, options.authToken);
+  if (selfPublicUrl) {
+    process.stdout.write(`[skyclaw] public url: ${selfPublicUrl}\n`);
+  }
+
+  if (peerSet.size > 0) {
+    process.stdout.write(`[skyclaw] peers: ${[...peerSet.values()].join(", ")}\n`);
+    void syncFromPeers(state, [...peerSet.values()], options.authToken);
+    if (peerDiscoveryEnabled) {
+      void discoverPeers(peerSet, [...peerSet.values()], options.authToken, selfPublicUrl);
+    }
   }
 }
 
@@ -328,6 +380,13 @@ async function applyMutationWithQuorum<T>(
   requiredPeerAcks: number,
   mutate: () => T
 ): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
+  if (peerUrls.length < requiredPeerAcks) {
+    return {
+      ok: false,
+      error: `insufficient peers: requires at least ${requiredPeerAcks} known peers, got ${peerUrls.length}`
+    };
+  }
+
   const checkpoint = state.checkpoint();
   try {
     const value = mutate();
@@ -435,6 +494,48 @@ async function syncFromPeers(state: CoordinatorState, peerUrls: string[], token?
         if (!response.ok) return;
         const snapshot = (await response.json()) as CoordinatorSnapshot;
         state.mergeSnapshot(snapshot);
+      } catch {
+        return;
+      }
+    })
+  );
+}
+
+async function discoverPeers(
+  peerSet: Set<string>,
+  seedPeers: string[],
+  token: string | undefined,
+  selfPublicUrl: string | undefined
+): Promise<void> {
+  await Promise.all(
+    seedPeers.map(async (peerUrl) => {
+      try {
+        const peersResponse = await fetch(`${peerUrl}/v1/network/peers`, {
+          headers: {
+            ...(token ? { "x-skyclaw-token": token } : {})
+          }
+        });
+        if (peersResponse.ok) {
+          const payload = (await peersResponse.json()) as { peers?: string[]; self?: string };
+          const candidates = [...(payload.peers || []), payload.self || ""];
+          for (const candidate of candidates) {
+            const normalized = normalizeBaseUrl(candidate);
+            if (!normalized) continue;
+            if (normalized === selfPublicUrl) continue;
+            peerSet.add(normalized);
+          }
+        }
+
+        if (selfPublicUrl) {
+          await fetch(`${peerUrl}/v1/network/join`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              ...(token ? { "x-skyclaw-token": token } : {})
+            },
+            body: JSON.stringify({ url: selfPublicUrl })
+          });
+        }
       } catch {
         return;
       }

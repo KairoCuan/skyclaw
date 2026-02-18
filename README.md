@@ -11,6 +11,7 @@ It is heavily inspired by `automaton-skyclaw`, but re-targeted so OpenClaw users
 - Schedules jobs to hosts with matching capabilities.
 - Persists queue state in SQLite with crash recovery.
 - Supports idempotent writes and multi-coordinator client failover.
+- Supports dynamic peer discovery for opt-in network growth.
 
 ## Architecture
 
@@ -33,6 +34,7 @@ npm run build
 export SKYCLAW_TOKEN=change-me
 export SKYCLAW_COORDINATOR_NODE_ID=node-a
 export SKYCLAW_COORDINATOR_PORT=8787
+export SKYCLAW_COORDINATOR_PUBLIC_URL=http://127.0.0.1:8787
 export SKYCLAW_PEER_URLS=http://127.0.0.1:8788
 export SKYCLAW_MIN_REPLICATIONS=2
 export SKYCLAW_DB_PATH=.skyclaw/node-a.db
@@ -45,6 +47,7 @@ node dist/cli.js coordinator
 export SKYCLAW_TOKEN=change-me
 export SKYCLAW_COORDINATOR_NODE_ID=node-b
 export SKYCLAW_COORDINATOR_PORT=8788
+export SKYCLAW_COORDINATOR_PUBLIC_URL=http://127.0.0.1:8788
 export SKYCLAW_PEER_URLS=http://127.0.0.1:8787
 export SKYCLAW_MIN_REPLICATIONS=2
 export SKYCLAW_DB_PATH=.skyclaw/node-b.db
@@ -77,6 +80,8 @@ node dist/cli.js enqueue-shell bash -lc "echo hello from decentralized skyclaw"
 - `POST /v1/jobs`
 - `POST /v1/jobs/:id/complete`
 - `POST /v1/replicate/snapshot`
+- `GET /v1/network/peers`
+- `POST /v1/network/join`
 - `GET /v1/state`
 - `GET /health`
 
@@ -84,8 +89,10 @@ node dist/cli.js enqueue-shell bash -lc "echo hello from decentralized skyclaw"
 
 - `SKYCLAW_COORDINATOR_URL`, `SKYCLAW_COORDINATOR_URLS`
 - `SKYCLAW_PEER_URLS`
+- `SKYCLAW_COORDINATOR_PUBLIC_URL`
 - `SKYCLAW_COORDINATOR_NODE_ID`
 - `SKYCLAW_MIN_REPLICATIONS` (default `2`)
+- `SKYCLAW_PEER_DISCOVERY` (default `1`)
 - `SKYCLAW_DB_PATH`
 - `SKYCLAW_TOKEN`
 - `SKYCLAW_CAPABILITIES`
@@ -101,3 +108,10 @@ node dist/cli.js enqueue-shell bash -lc "echo hello from decentralized skyclaw"
 ## Status
 
 This is an MVP decentralized coordinator/worker layer for OpenClaw.
+
+## Dynamic P2P Opt-In
+
+- Start with one or more bootstrap peers in `SKYCLAW_PEER_URLS`.
+- Set a reachable `SKYCLAW_COORDINATOR_PUBLIC_URL` on each coordinator.
+- Coordinators gossip known peers and auto-announce themselves with `/v1/network/join`.
+- As nodes discover each other, the replication peer set expands automatically.

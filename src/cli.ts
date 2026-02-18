@@ -15,7 +15,9 @@ function printHelp(): void {
   process.stdout.write(`  SKYCLAW_COORDINATOR_URLS=http://127.0.0.1:8787,http://127.0.0.1:8788\n`);
   process.stdout.write(`  SKYCLAW_PEER_URLS=http://127.0.0.1:8788,http://127.0.0.1:8789\n`);
   process.stdout.write(`  SKYCLAW_COORDINATOR_NODE_ID=node-a\n`);
+  process.stdout.write(`  SKYCLAW_COORDINATOR_PUBLIC_URL=http://<public-host>:8787\n`);
   process.stdout.write(`  SKYCLAW_MIN_REPLICATIONS=2\n`);
+  process.stdout.write(`  SKYCLAW_PEER_DISCOVERY=1\n`);
   process.stdout.write(`  SKYCLAW_IDEMPOTENCY_TTL_MS=86400000\n`);
   process.stdout.write(`  SKYCLAW_TOKEN=<shared-token>\n`);
   process.stdout.write(`  SKYCLAW_ALLOWED_COMMANDS=openclaw,node,bash,sh\n`);
@@ -83,10 +85,12 @@ async function main(): Promise<void> {
       leaseMs: parseIntEnv("SKYCLAW_LEASE_MS", 60_000),
       dbPath: process.env.SKYCLAW_DB_PATH || ".skyclaw/coordinator.db",
       nodeId: process.env.SKYCLAW_COORDINATOR_NODE_ID,
+      publicUrl: process.env.SKYCLAW_COORDINATOR_PUBLIC_URL,
       peerUrls,
       peerSyncIntervalMs: parseIntEnv("SKYCLAW_PEER_SYNC_MS", 3_000),
       minReplicas: parseIntEnv("SKYCLAW_MIN_REPLICATIONS", 2),
-      idempotencyTtlMs: parseIntEnv("SKYCLAW_IDEMPOTENCY_TTL_MS", 86_400_000)
+      idempotencyTtlMs: parseIntEnv("SKYCLAW_IDEMPOTENCY_TTL_MS", 86_400_000),
+      peerDiscoveryEnabled: process.env.SKYCLAW_PEER_DISCOVERY !== "0"
     });
     return;
   }

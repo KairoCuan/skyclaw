@@ -21,11 +21,18 @@ Think: shared, opt-in infrastructure where independent nodes can join, execute j
 
 ## How it works
 
-1. Coordinators form a peer cluster.
-2. OpenClaw hosts register and heartbeat.
-3. Jobs are enqueued (`shell` or `openclaw-run`).
-4. Eligible hosts claim and execute jobs.
-5. Results are posted back to the cluster.
+1. Coordinators join from bootstrap peers.
+2. Coordinators discover and gossip peers automatically (`/v1/network/peers`, `/v1/network/join`).
+3. OpenClaw hosts register and heartbeat.
+4. Jobs are enqueued (`shell` or `openclaw-run`).
+5. Eligible hosts claim and execute jobs.
+6. Results are posted back to the cluster.
+
+## P2P opt-in network
+
+- New coordinators can opt in with minimal config and bootstrap peers.
+- Peer membership expands dynamically as nodes discover each other.
+- The network can grow without manually wiring every node to every other node.
 
 ## Safety and reliability (MVP)
 
@@ -46,6 +53,7 @@ Think: shared, opt-in infrastructure where independent nodes can join, execute j
 Skyclaw is an MVP, but it already supports:
 
 - Multi-node coordinator replication
+- Dynamic peer discovery and coordinator self-announcement
 - Host failover across coordinator URLs
 - Durable queue state
 - OpenClaw-specific job scheduling
