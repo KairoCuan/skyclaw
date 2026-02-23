@@ -216,7 +216,7 @@ See [planned hardening](#why-this-fork) for production roadmap.
 
 ## Related Projects
 
-- [Jalikan](https://github.com/SHA888/jalikan) — Agent-first DEX protocol on Base L2
+- [Jalikan](https://github.com/KairoCuan/jalikan) — Agent-first DEX protocol on Base L2
 - [KairoCuan](https://github.com/KairoCuan) — Autonomous trading agents
 - [Conway Research / Automaton](https://github.com/Conway-Research/automaton) — Sovereign AI agent runtime
 - [Web4Indo](https://web4indo.org) — Web4 education platform (ID)
